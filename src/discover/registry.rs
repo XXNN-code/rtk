@@ -40,6 +40,10 @@ const PHP_TOOL_NAMES: [&str; 6] = ["phpunit", "phpstan", "ecs", "pest", "parates
 #[derive(Debug, PartialEq)]
 pub enum Classification {
     Supported {
+        /// The rule that matched, an index into [`RULES`]: the last of those whose pattern
+        /// matches. The rewrite and the `exclude_commands` check act on this rule, so the
+        /// rule is never looked up again (two rules can share an `rtk_equivalent`).
+        rule: usize,
         rtk_equivalent: &'static str,
         category: &'static str,
         estimated_savings_pct: f64,
@@ -352,6 +356,7 @@ fn classify_clean(cmd_clean: &str) -> Classification {
         };
 
         Classification::Supported {
+            rule: idx,
             rtk_equivalent: rule.rtk_cmd,
             category: rule.category,
             estimated_savings_pct: savings,
@@ -3339,12 +3344,12 @@ fn command_is_excluded(
         .into_iter()
         .flatten()
         .any(|class| {
-            matches!(class, Classification::Supported { rtk_equivalent, .. }
+            matches!(class, Classification::Supported { rule, .. }
                 if [typed.as_ref(), named.as_str()]
                     .into_iter()
                     .enumerate()
                     .any(|(i, text)| (i == 0 || text != typed)
-                        && is_excluded(&tool_form(text, rtk_equivalent), excluded)))
+                        && is_excluded(&tool_form(text, &RULES[*rule]), excluded)))
         })
 }
 
@@ -3495,8 +3500,8 @@ fn decide(
         return None;
     }
 
-    let rtk_equivalent = match classification {
-        Classification::Supported { rtk_equivalent, .. } => rtk_equivalent,
+    let rule = match classification {
+        Classification::Supported { rule, .. } => &RULES[rule],
         // TOML-only commands: consult the registry so the hook filters them too (#2179).
         Classification::Unsupported { .. } => {
             if context != RewriteContext::Normal || toml_disabled() {
@@ -3515,8 +3520,6 @@ fn decide(
         Classification::Ignored => return None,
     };
 
-    // Find the matching rule (rtk_cmd values are unique across all rules)
-    let rule = RULES.iter().find(|r| r.rtk_cmd == rtk_equivalent)?;
     if context == RewriteContext::PipelineFinal
         && (!rule.pipeline_safety.final_safe() || !pipeline_command_is_safe(rule.rtk_cmd, argv))
     {
@@ -3624,13 +3627,6 @@ fn tool_portion(prefix: &'static str, rule: &RtkRule) -> &'static str {
     best
 }
 
-/// Rewrite a command into the spelling `exclude_commands` is written against.
-///
-/// An entry names a tool, but the command may spell it with a wrapper
-/// (`npx playwright test`), an interpreter (`python3 -m pytest tests/`) or a path
-/// (`vendor/bin/phpunit tests/`). Peeling that spelling down to the tool lets one entry
-/// cover every form. The arguments are kept, so an anchored pattern still means what it
-/// says: `"^ls$"` excludes a bare `ls` without swallowing `ls -la`.
 /// Canonical `<tool> <args>` form of a Composer-resolved PHP tool invocation, peeling
 /// the `php` wrapper and its ini flags, a leading `./`, and a vendor/composer bin dir.
 /// `None` when `rtk_cmd` is not one of those tools.
@@ -3646,11 +3642,21 @@ fn php_tool_form(cmd: &str, rtk_cmd: &str) -> Option<String> {
     Some(normalize_php_tool_command(unwrapped))
 }
 
-fn tool_form(cmd_clean: &str, rtk_equivalent: &str) -> String {
+/// Rewrite a command into the spelling `exclude_commands` is written against.
+///
+/// An entry names a tool, but the command may spell it with a wrapper
+/// (`npx playwright test`), an interpreter (`python3 -m pytest tests/`) or a path
+/// (`vendor/bin/phpunit tests/`). Peeling that spelling down to the tool lets one entry
+/// cover every form. The arguments are kept, so an anchored pattern still means what it
+/// says: `"^ls$"` excludes a bare `ls` without swallowing `ls -la`.
+///
+/// `rule` is a rule that classified the command, in this spelling or another one of it
+/// (the words as typed or as the shell reads them): its `rewrite_prefixes` are the
+/// spellings peeled, and its `rtk_cmd` says whether the PHP tool forms apply.
+fn tool_form(cmd_clean: &str, rule: &RtkRule) -> String {
     // Same normalization the rewrite path applies, so the exclusion sees the tool
     // whichever way it was spelled — including `php vendor/bin/phpunit`.
-    let unwrapped =
-        php_tool_form(cmd_clean, rtk_equivalent).unwrap_or_else(|| cmd_clean.to_string());
+    let unwrapped = php_tool_form(cmd_clean, rule.rtk_cmd).unwrap_or_else(|| cmd_clean.to_string());
     // A quoted first word may hold a blank and a `/` in one name, which a cut
     // at the first blank would split; the caller reads it from its words.
     let first_word = unwrapped.split(is_ifs).next().unwrap_or_default();
@@ -3659,25 +3665,22 @@ fn tool_form(cmd_clean: &str, rtk_equivalent: &str) -> String {
     } else {
         strip_absolute_path(&unwrapped)
     };
-    if rtk_equivalent == "rtk cargo" {
+    if rule.rtk_cmd == "rtk cargo" {
         return normalize_cargo_command(&normalized);
     }
-    RULES
+    rule.rewrite_prefixes
         .iter()
-        .find(|r| r.rtk_cmd == rtk_equivalent)
-        .and_then(|rule| {
-            rule.rewrite_prefixes.iter().find_map(|&prefix| {
-                // What follows the prefix is kept as spelled, an empty
-                // argument included, so `pytest ''` is not `pytest`.
-                let tail = normalized.strip_prefix(prefix)?;
-                if !tail.is_empty() && !tail.starts_with(is_ifs) {
-                    return None;
-                }
-                // No rewrite prefix carries a path outside its first token, and that
-                // token is already a basename here, so `tool_portion` needs no strip.
-                let tool = tool_portion(prefix, rule);
-                Some(format!("{tool}{tail}"))
-            })
+        .find_map(|&prefix| {
+            // What follows the prefix is kept as spelled, an empty
+            // argument included, so `pytest ''` is not `pytest`.
+            let tail = normalized.strip_prefix(prefix)?;
+            if !tail.is_empty() && !tail.starts_with(is_ifs) {
+                return None;
+            }
+            // No rewrite prefix carries a path outside its first token, and that
+            // token is already a basename here, so `tool_portion` needs no strip.
+            let tool = tool_portion(prefix, rule);
+            Some(format!("{tool}{tail}"))
         })
         .unwrap_or(normalized)
 }
@@ -5333,6 +5336,7 @@ mod tests {
         assert_eq!(
             classify_command("git status"),
             Classification::Supported {
+                rule: rule_of("rtk git"),
                 rtk_equivalent: "rtk git",
                 category: "Git",
                 estimated_savings_pct: 70.0,
@@ -5346,6 +5350,7 @@ mod tests {
         assert_eq!(
             classify_command("yadm status"),
             Classification::Supported {
+                rule: rule_of("rtk git"),
                 rtk_equivalent: "rtk git",
                 category: "Git",
                 estimated_savings_pct: 70.0,
@@ -5359,6 +5364,7 @@ mod tests {
         assert_eq!(
             classify_command("yadm diff"),
             Classification::Supported {
+                rule: rule_of("rtk git"),
                 rtk_equivalent: "rtk git",
                 category: "Git",
                 estimated_savings_pct: 80.0,
@@ -5380,6 +5386,7 @@ mod tests {
         assert_eq!(
             classify_command("git diff --cached"),
             Classification::Supported {
+                rule: rule_of("rtk git"),
                 rtk_equivalent: "rtk git",
                 category: "Git",
                 estimated_savings_pct: 80.0,
@@ -5393,6 +5400,7 @@ mod tests {
         assert_eq!(
             classify_command("cargo test filter::"),
             Classification::Supported {
+                rule: rule_of("rtk cargo"),
                 rtk_equivalent: "rtk cargo",
                 category: "Cargo",
                 estimated_savings_pct: 90.0,
@@ -5406,6 +5414,7 @@ mod tests {
         assert_eq!(
             classify_command("npx tsc --noEmit"),
             Classification::Supported {
+                rule: rule_of("rtk tsc"),
                 rtk_equivalent: "rtk tsc",
                 category: "Build",
                 estimated_savings_pct: 83.0,
@@ -5419,6 +5428,7 @@ mod tests {
         assert_eq!(
             classify_command("cat src/main.rs"),
             Classification::Supported {
+                rule: rule_of("rtk read"),
                 rtk_equivalent: "rtk read",
                 category: "Files",
                 estimated_savings_pct: 60.0,
@@ -5594,6 +5604,7 @@ mod tests {
             assert_eq!(
                 classify_command(cmd),
                 Classification::Supported {
+                    rule: rule_of("rtk git"),
                     rtk_equivalent: "rtk git",
                     category: "Git",
                     estimated_savings_pct: 70.0,
@@ -5622,6 +5633,7 @@ mod tests {
         assert_eq!(
             classify_command("cargo check"),
             Classification::Supported {
+                rule: rule_of("rtk cargo"),
                 rtk_equivalent: "rtk cargo",
                 category: "Cargo",
                 estimated_savings_pct: 80.0,
@@ -5635,6 +5647,7 @@ mod tests {
         assert_eq!(
             classify_command("cargo check --all-targets"),
             Classification::Supported {
+                rule: rule_of("rtk cargo"),
                 rtk_equivalent: "rtk cargo",
                 category: "Cargo",
                 estimated_savings_pct: 80.0,
@@ -5650,6 +5663,7 @@ mod tests {
         assert_eq!(
             classify_command("cargo fmt"),
             Classification::Supported {
+                rule: rule_of("rtk cargo"),
                 rtk_equivalent: "rtk cargo",
                 category: "Cargo",
                 estimated_savings_pct: 0.0,
@@ -5663,6 +5677,7 @@ mod tests {
         assert_eq!(
             classify_command("cargo clippy --all-targets"),
             Classification::Supported {
+                rule: rule_of("rtk cargo"),
                 rtk_equivalent: "rtk cargo",
                 category: "Cargo",
                 estimated_savings_pct: 80.0,
@@ -5706,6 +5721,7 @@ mod tests {
         assert_eq!(
             classify_command("find . -name foo"),
             Classification::Supported {
+                rule: rule_of("rtk find"),
                 rtk_equivalent: "rtk find",
                 category: "Files",
                 estimated_savings_pct: 70.0,
@@ -6510,6 +6526,7 @@ mod tests {
         assert_eq!(
             classify_command("mypy src/"),
             Classification::Supported {
+                rule: rule_of("rtk mypy"),
                 rtk_equivalent: "rtk mypy",
                 category: "Build",
                 estimated_savings_pct: 80.0,
@@ -6523,6 +6540,7 @@ mod tests {
         assert_eq!(
             classify_command("python3 -m mypy --strict"),
             Classification::Supported {
+                rule: rule_of("rtk mypy"),
                 rtk_equivalent: "rtk mypy",
                 category: "Build",
                 estimated_savings_pct: 80.0,
@@ -6790,6 +6808,7 @@ mod tests {
         assert_eq!(
             classify_command("ctest -R smoke --output-on-failure"),
             Classification::Supported {
+                rule: rule_of("rtk ctest"),
                 rtk_equivalent: "rtk ctest",
                 category: "Tests",
                 estimated_savings_pct: 80.0,
@@ -8275,6 +8294,7 @@ mod tests {
         assert_eq!(
             classify_command(r#"GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=no" git push"#),
             Classification::Supported {
+                rule: rule_of("rtk git"),
                 rtk_equivalent: "rtk git",
                 category: "Git",
                 estimated_savings_pct: 70.0,
@@ -9313,6 +9333,7 @@ mod tests {
                 category: "Build",
                 estimated_savings_pct: 90.0,
                 status: RtkStatus::Existing,
+                ..
             }
         ));
     }
@@ -10662,6 +10683,7 @@ mod tests {
         assert_eq!(
             classify_command("./gradlew test"),
             Classification::Supported {
+                rule: rule_of("rtk gradlew"),
                 rtk_equivalent: "rtk gradlew",
                 category: "Build",
                 estimated_savings_pct: 90.0,
@@ -11389,35 +11411,51 @@ mod tests {
         );
     }
 
-    /// `classify_command` picks a rule by index, then `decide` looks one up
-    /// again by `rtk_cmd` with `find` — which takes the first of a duplicate
-    /// pair, not necessarily the one that classified.
-    ///
-    /// `rtk php` and `rtk uv` are each two rules, so that lookup already
-    /// returns a sibling. It is harmless only because every field it reads
-    /// matches across the pair; an edit to one sibling's `pipeline_safety` or
-    /// `rewrite_prefixes` would silently apply to the other's commands.
+    /// A classification names the rule that matched, the last of the rules that do, and
+    /// the rewrite acts on that rule: of the two rules that route to `rtk uv` or `rtk php`,
+    /// each command is matched by its own, and a command several rules match is the last's.
     #[test]
-    fn test_duplicate_rtk_cmds_agree_on_what_the_rewrite_reads() {
-        for rule in RULES {
-            let siblings: Vec<&RtkRule> =
-                RULES.iter().filter(|r| r.rtk_cmd == rule.rtk_cmd).collect();
-            let first = siblings[0];
-            for sibling in &siblings[1..] {
-                assert_eq!(
-                    sibling.rewrite_prefixes, first.rewrite_prefixes,
-                    "{} is several rules with different rewrite_prefixes, and the \
-                     rewrite reads whichever comes first",
-                    rule.rtk_cmd
-                );
-                assert_eq!(
-                    sibling.pipeline_safety, first.pipeline_safety,
-                    "{} is several rules with different pipeline_safety, and the \
-                     rewrite reads whichever comes first",
-                    rule.rtk_cmd
-                );
+    fn test_the_classification_names_the_rule_that_matched() {
+        let rule_of_command = |command: &str| match classify_command(command) {
+            Classification::Supported {
+                rule,
+                rtk_equivalent,
+                category,
+                ..
+            } => {
+                assert_eq!(RULES[rule].rtk_cmd, rtk_equivalent, "{command}");
+                assert_eq!(RULES[rule].category, category, "{command}");
+                assert!(COMPILED[rule].is_match(command), "{command}");
+                rule
             }
-        }
+            other => panic!("{command}: {other:?}"),
+        };
+        let (run, sync) = (rule_of_command("uv run pytest"), rule_of_command("uv sync"));
+        assert_ne!(run, sync);
+        assert_eq!(RULES[run].rtk_cmd, RULES[sync].rtk_cmd);
+        let (artisan, lint) = (
+            rule_of_command("php artisan migrate"),
+            rule_of_command("php -l x.php"),
+        );
+        assert_ne!(artisan, lint);
+        assert_eq!(RULES[artisan].rtk_cmd, RULES[lint].rtk_cmd);
+        // `pnpm exec vitest` matches the `pnpm` rule and the `vitest` rule, which comes later.
+        let vitest = rule_of_command("pnpm exec vitest");
+        assert_eq!(RULES[vitest].rtk_cmd, "rtk vitest");
+        let matching: Vec<usize> = REGEX_SET.matches("pnpm exec vitest").into_iter().collect();
+        assert!(matching.len() > 1);
+        assert_eq!(matching.last(), Some(&vitest));
+    }
+
+    /// The index of the one rule that routes to `rtk_cmd`.
+    fn rule_of(rtk_cmd: &str) -> usize {
+        let mut routed = RULES
+            .iter()
+            .enumerate()
+            .filter(|(_, rule)| rule.rtk_cmd == rtk_cmd);
+        let (index, _) = routed.next().expect("a rule routes to the command");
+        assert!(routed.next().is_none(), "{rtk_cmd} is several rules");
+        index
     }
 
     #[test]
@@ -11811,6 +11849,7 @@ mod tests {
         assert_eq!(
             classify_command("/usr/bin/grep -rni pattern"),
             Classification::Supported {
+                rule: rule_of("rtk grep"),
                 rtk_equivalent: "rtk grep",
                 category: "Files",
                 estimated_savings_pct: 75.0,
@@ -11824,6 +11863,7 @@ mod tests {
         assert_eq!(
             classify_command("/bin/ls -la"),
             Classification::Supported {
+                rule: rule_of("rtk ls"),
                 rtk_equivalent: "rtk ls",
                 category: "Files",
                 estimated_savings_pct: 65.0,
@@ -11837,6 +11877,7 @@ mod tests {
         assert_eq!(
             classify_command("/usr/local/bin/git status"),
             Classification::Supported {
+                rule: rule_of("rtk git"),
                 rtk_equivalent: "rtk git",
                 category: "Git",
                 estimated_savings_pct: 70.0,
@@ -11851,6 +11892,7 @@ mod tests {
         assert_eq!(
             classify_command("/usr/bin/find ."),
             Classification::Supported {
+                rule: rule_of("rtk find"),
                 rtk_equivalent: "rtk find",
                 category: "Files",
                 estimated_savings_pct: 70.0,
@@ -11874,6 +11916,7 @@ mod tests {
         assert_eq!(
             classify_command("git -C /tmp status"),
             Classification::Supported {
+                rule: rule_of("rtk git"),
                 rtk_equivalent: "rtk git",
                 category: "Git",
                 estimated_savings_pct: 70.0,
@@ -11887,6 +11930,7 @@ mod tests {
         assert_eq!(
             classify_command("git --no-pager log -5"),
             Classification::Supported {
+                rule: rule_of("rtk git"),
                 rtk_equivalent: "rtk git",
                 category: "Git",
                 estimated_savings_pct: 70.0,
@@ -11900,6 +11944,7 @@ mod tests {
         assert_eq!(
             classify_command("git --git-dir /tmp/.git status"),
             Classification::Supported {
+                rule: rule_of("rtk git"),
                 rtk_equivalent: "rtk git",
                 category: "Git",
                 estimated_savings_pct: 70.0,
@@ -11966,6 +12011,7 @@ mod tests {
         assert_eq!(
             classify_command("wc -l src/main.rs"),
             Classification::Supported {
+                rule: rule_of("rtk wc"),
                 rtk_equivalent: "rtk wc",
                 category: "Files",
                 estimated_savings_pct: 60.0,
@@ -11979,6 +12025,7 @@ mod tests {
         assert_eq!(
             classify_command("wc src/*.rs"),
             Classification::Supported {
+                rule: rule_of("rtk wc"),
                 rtk_equivalent: "rtk wc",
                 category: "Files",
                 estimated_savings_pct: 60.0,
@@ -12008,6 +12055,7 @@ mod tests {
         assert_eq!(
             classify_command("git log $(git rev-parse HEAD~1)"),
             Classification::Supported {
+                rule: rule_of("rtk git"),
                 rtk_equivalent: "rtk git",
                 category: "Git",
                 estimated_savings_pct: 70.0,
